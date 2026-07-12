@@ -53,7 +53,7 @@ on:
         description: 'Max conversation turns (overrides task_complexity if > 0)'
         required: false
         type: number
-        default: 30
+        default: 0
       assignee:
         description: 'Atlassian display name of the responsible engineer (e.g., "John Doe"). Resolved to a GitHub username by matching against viamrobotics org members.'
         required: false
