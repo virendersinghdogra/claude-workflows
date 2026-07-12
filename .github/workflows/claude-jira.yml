@@ -306,6 +306,7 @@ jobs:
           AUTH_TEST_CREDENTIALS: ${{ secrets.AUTH_TEST_CREDENTIALS }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           show_full_output: ${{ inputs.show_full_output }}
           display_report: true
           settings: .claude/settings.ci.json
