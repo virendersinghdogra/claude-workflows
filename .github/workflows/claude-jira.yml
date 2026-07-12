@@ -53,7 +53,7 @@ on:
         description: 'Max conversation turns (overrides task_complexity if > 0)'
         required: false
         type: number
-        default: 0
+        default: 30
       assignee:
         description: 'Atlassian display name of the responsible engineer (e.g., "John Doe"). Resolved to a GitHub username by matching against viamrobotics org members.'
         required: false
@@ -298,7 +298,7 @@ jobs:
         env:
           SYSTEM_PROMPT_PREAMBLE: "Before modifying any file, explore the relevant code first."
           EXTRA_SYSTEM_PROMPT: ${{ inputs.extra_system_prompt }}
-        run: .ci-prompts/scripts/assemble-system-prompt.sh
+        run: bash .ci-prompts/scripts/assemble-system-prompt.sh
 
       - id: claude
         uses: anthropics/claude-code-action@26ddc358fe3befff50c5ec2f80304c90c763f6f8 # v1.0.90
