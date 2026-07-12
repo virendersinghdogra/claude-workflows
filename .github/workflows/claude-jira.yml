@@ -1,0 +1,514 @@
+name: Claude Jira Implementation (Reusable)
+
+# Implements a Jira ticket with Claude Code: branches with a claude/ prefix,
+# opens a PR, alerts Slack on failure. Callers handle triggers and pass ticket data.
+
+on:
+  workflow_call:
+    inputs:
+      # --- Required ---
+      ticket_id:
+        description: 'Jira ticket ID (e.g., SDK-123)'
+        required: true
+        type: string
+      summary:
+        description: 'Ticket summary'
+        required: true
+        type: string
+      description:
+        description: 'Ticket description'
+        required: true
+        type: string
+      allowed_tools:
+        description: 'Allowed tools string for claude-code-action'
+        required: true
+        type: string
+      # --- Optional ---
+      install_command:
+        description: 'Command to install dependencies (e.g., "npm ci" or "make install")'
+        required: false
+        type: string
+        default: ''
+      extra_prompt:
+        description: 'Extra instructions appended to the Claude prompt (user message)'
+        required: false
+        type: string
+        default: ''
+      extra_system_prompt:
+        description: 'Extra instructions appended to the CI system prompt file'
+        required: false
+        type: string
+        default: ''
+      model:
+        description: 'Claude model to use'
+        required: false
+        type: string
+        default: 'claude-opus-4-6'
+      task_complexity:
+        description: 'Task complexity: small (50 turns), medium (75), large (100). Ignored if max_turns is set.'
+        required: false
+        type: string
+        default: 'small'
+      max_turns:
+        description: 'Max conversation turns (overrides task_complexity if > 0)'
+        required: false
+        type: number
+        default: 0
+      assignee:
+        description: 'Atlassian display name of the responsible engineer (e.g., "John Doe"). Resolved to a GitHub username by matching against viamrobotics org members.'
+        required: false
+        type: string
+        default: ''
+      assignee_email:
+        description: 'Atlassian email of the responsible engineer. Used as the primary signal for matching to a GitHub username.'
+        required: false
+        type: string
+        default: ''
+      show_full_output:
+        description: 'Show full JSON output from Claude Code. WARNING: may expose secrets in logs.'
+        required: false
+        type: boolean
+        default: false
+      repository_owner:
+        description: 'Expected repository owner for guard condition'
+        required: false
+        type: string
+        default: 'virendersinghdogra'
+      jira_base_url:
+        description: 'Jira instance base URL (e.g., "https://myorg.atlassian.net")'
+        required: false
+        type: string
+        default: ''
+      jira_user_email:
+        description: 'Jira user email for API authentication'
+        required: false
+        type: string
+        default: ''
+      container:
+        description: 'Container image for the implement job (e.g., "ubuntu:22.04"). Leave empty for bare runner.'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      # Org-level secret; key claude_code_key_jira_github_action (Claude Console).
+      ANTHROPIC_API_KEY:
+        required: true
+      # Org-level secret; alerts to #ai-workflows-alerts. Override per-repo to redirect.
+      SLACK_AI_WORKFLOW_ALERT_WEBHOOK_URL:
+        required: false
+      CI_GITHUB_APP_ID:
+        required: true
+      CI_GITHUB_APP_PRIVATE_KEY:
+        required: true
+      AUTH_TEST_CREDENTIALS:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      max_turns: ${{ steps.resolve.outputs.max_turns }}
+      github_user: ${{ steps.assignee.outputs.github_user }}
+    steps:
+      - name: Map task complexity to max turns
+        id: resolve
+        env:
+          MAX_TURNS: ${{ inputs.max_turns }}
+          COMPLEXITY: ${{ inputs.task_complexity }}
+        run: |
+          if [ "$MAX_TURNS" -gt 0 ] 2>/dev/null; then
+            echo "max_turns=$MAX_TURNS" >> "$GITHUB_OUTPUT"
+          else
+            case "$COMPLEXITY" in
+              medium) echo "max_turns=150" >> "$GITHUB_OUTPUT" ;;
+              large)  echo "max_turns=200" >> "$GITHUB_OUTPUT" ;;
+              *)      echo "max_turns=100" >> "$GITHUB_OUTPUT" ;;
+            esac
+          fi
+
+      - name: Generate org-scoped token
+        id: org-token
+        if: inputs.assignee != '' || inputs.assignee_email != ''
+        # actions/create-github-app-token@v2.2.1
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf
+        with:
+          app-id: ${{ secrets.CI_GITHUB_APP_ID }}
+          private-key: ${{ secrets.CI_GITHUB_APP_PRIVATE_KEY }}
+          owner: virendersinghdogra
+          permission-members: read
+
+      - name: Resolve GitHub assignee from Atlassian identity
+        id: assignee
+        if: inputs.assignee != '' || inputs.assignee_email != ''
+        env:
+          ATLASSIAN_NAME: ${{ inputs.assignee }}
+          ATLASSIAN_EMAIL: ${{ inputs.assignee_email }}
+          GH_TOKEN: ${{ steps.org-token.outputs.token }}
+        run: |
+          set -o pipefail
+          # shellcheck disable=SC2016
+          # Fetch all org members (login, name, email) via GraphQL. Runs on a bare
+          # runner, not the caller's container, so gh is always available.
+          MEMBERS=$(gh api graphql --paginate \
+            -f org="virendersinghdogra" \
+            -f query='
+              query($org: String!, $endCursor: String) {
+                organization(login: $org) {
+                  membersWithRole(first: 100, after: $endCursor) {
+                    nodes { login name email }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+              }' --jq '.data.organization.membersWithRole.nodes[]' | jq -s '.')
+
+          if [ "$MEMBERS" = "[]" ] || [ -z "$MEMBERS" ]; then
+            echo "::warning::Could not fetch viamrobotics org members"
+            exit 0
+          fi
+
+          GITHUB_USER=""
+
+          # --- Email-based strategies (highest confidence) ---
+
+          # Strategy 1: Exact match on public GitHub email
+          if [ -z "$GITHUB_USER" ] && [ -n "$ATLASSIAN_EMAIL" ]; then
+            EMAIL_LOWER=$(echo "$ATLASSIAN_EMAIL" | tr '[:upper:]' '[:lower:]')
+            GITHUB_USER=$(echo "$MEMBERS" | jq -r --arg s "$EMAIL_LOWER" \
+              '.[] | select(.email != null and .email != "") |
+               select((.email | ascii_downcase) == $s) |
+               .login' | head -1)
+          fi
+
+          # Strategy 2: Match email local part against login (e.g., john.doe@viam.com -> johndoe)
+          if [ -z "$GITHUB_USER" ] && [ -n "$ATLASSIAN_EMAIL" ]; then
+            LOCAL_PART=$(echo "$ATLASSIAN_EMAIL" | cut -d@ -f1 | tr '[:upper:]' '[:lower:]')
+            LOCAL_COMPACT=$(echo "$LOCAL_PART" | tr -d '._-')
+            GITHUB_USER=$(echo "$MEMBERS" | jq -r --arg s "$LOCAL_COMPACT" \
+              '.[] | select((.login | ascii_downcase | gsub("[._-]"; "")) == $s) |
+               .login' | head -1)
+          fi
+
+          # Strategy 3: Match email local part against display name (e.g., john.doe -> "John Doe")
+          if [ -z "$GITHUB_USER" ] && [ -n "$ATLASSIAN_EMAIL" ]; then
+            LOCAL_NORM=$(echo "$LOCAL_PART" | sed 's/[._-]/ /g' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+            GITHUB_USER=$(echo "$MEMBERS" | jq -r --arg s "$LOCAL_NORM" \
+              '.[] | select(.name != null) |
+               select((.name | ascii_downcase | gsub("[._-]"; " ") | gsub(" +"; " ")) == $s) |
+               .login' | head -1)
+          fi
+
+          # --- Display-name-based strategies (fallback) ---
+
+          if [ -z "$GITHUB_USER" ] && [ -n "$ATLASSIAN_NAME" ]; then
+            INPUT_LOWER=$(echo "$ATLASSIAN_NAME" | tr '[:upper:]' '[:lower:]')
+            INPUT_NORM=$(echo "$INPUT_LOWER" | sed 's/[._-]/ /g' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+            INPUT_COMPACT=$(echo "$INPUT_NORM" | tr -d ' ')
+
+            # Strategy 4: Exact match on display name (case-insensitive, separators normalized)
+            GITHUB_USER=$(echo "$MEMBERS" | jq -r --arg s "$INPUT_NORM" \
+              '.[] | select(.name != null) |
+               select((.name | ascii_downcase | gsub("[._-]"; " ") | gsub(" +"; " ")) == $s) |
+               .login' | head -1)
+
+            # Strategy 5: Exact match on login
+            if [ -z "$GITHUB_USER" ]; then
+              GITHUB_USER=$(echo "$MEMBERS" | jq -r --arg s "$INPUT_LOWER" \
+                '.[] | select((.login | ascii_downcase) == $s) | .login' | head -1)
+            fi
+
+            # Strategy 6: Compact match (strip all separators from both sides)
+            if [ -z "$GITHUB_USER" ]; then
+              GITHUB_USER=$(echo "$MEMBERS" | jq -r --arg s "$INPUT_COMPACT" \
+                '.[] | select((.login | ascii_downcase | gsub("[._-]"; "")) == $s) |
+                 .login' | head -1)
+            fi
+
+            # Strategy 7: All input tokens appear in the display name
+            if [ -z "$GITHUB_USER" ]; then
+              GITHUB_USER=$(echo "$MEMBERS" | jq -r --arg s "$INPUT_NORM" \
+                '($s | split(" ")) as $tokens |
+                 .[] | select(.name != null) |
+                 (.name | ascii_downcase | gsub("[._-]"; " ") | split(" ")) as $parts |
+                 select(all($tokens[]; . as $t | any($parts[]; startswith($t)))) |
+                 .login' | head -1)
+            fi
+          fi
+
+          if [ -n "$GITHUB_USER" ]; then
+            echo "github_user=$GITHUB_USER" >> "$GITHUB_OUTPUT"
+            echo "Resolved Atlassian identity -> GitHub user: $GITHUB_USER"
+          else
+            echo "::warning::Could not match Atlassian identity (name='$ATLASSIAN_NAME', email='$ATLASSIAN_EMAIL') to any GitHub user in viamrobotics org"
+          fi
+
+  implement:
+    needs: resolve-inputs
+    if: github.repository_owner == inputs.repository_owner
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    runs-on: ubuntu-latest
+    container: ${{ inputs.container || '' }}
+    steps:
+      - name: Comment on Jira ticket that implementation is starting
+        if: inputs.jira_base_url != '' && inputs.jira_user_email != ''
+        env:
+          JIRA_BASE_URL: ${{ inputs.jira_base_url }}
+          JIRA_USER_EMAIL: ${{ inputs.jira_user_email }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_ID: ${{ inputs.ticket_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$JIRA_API_TOKEN" ]; then
+            echo "JIRA_API_TOKEN not set, skipping Jira comment"
+            exit 0
+          fi
+          curl -sf -X POST \
+            "$JIRA_BASE_URL/rest/api/3/issue/$TICKET_ID/comment" \
+            -u "$JIRA_USER_EMAIL:$JIRA_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"🤖 Claude is starting work on this ticket. \"},{\"type\":\"text\",\"text\":\"Follow progress\",\"marks\":[{\"type\":\"link\",\"attrs\":{\"href\":\"$RUN_URL\"}}]}]}]}}"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        if: inputs.install_command != ''
+        run: ${{ inputs.install_command }}
+
+      - name: Checkout CI prompts and scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: virendersinghdogra/claude-ci-workflows
+          ref: main
+          path: .ci-prompts
+          sparse-checkout: |
+            prompts/
+            scripts/
+          sparse-checkout-cone-mode: false
+
+      - name: Assemble CI system prompt
+        env:
+          SYSTEM_PROMPT_PREAMBLE: "Before modifying any file, explore the relevant code first."
+          EXTRA_SYSTEM_PROMPT: ${{ inputs.extra_system_prompt }}
+        run: .ci-prompts/scripts/assemble-system-prompt.sh
+
+      - id: claude
+        uses: anthropics/claude-code-action@26ddc358fe3befff50c5ec2f80304c90c763f6f8 # v1.0.90
+        env:
+          AUTH_TEST_CREDENTIALS: ${{ secrets.AUTH_TEST_CREDENTIALS }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          show_full_output: ${{ inputs.show_full_output }}
+          display_report: true
+          settings: .claude/settings.ci.json
+          prompt: |
+            Implement the following Jira ticket:
+
+            Ticket: ${{ inputs.ticket_id }}
+            Summary: ${{ inputs.summary }}
+            Description: ${{ inputs.description }}
+
+            Instructions:
+            - Read CLAUDE.md for repository conventions.
+            - Add or update unit tests for changed behavior.
+            - Branch name MUST start with `claude/` prefix.
+            - Before creating a branch, committing, or pushing, run `git status --porcelain`. If the output is empty, do NOT create a branch — write a short explanation to /tmp/no-changes-reason.txt and stop.
+            - If after investigating you determine this SDK does not need changes for this ticket, write a short explanation to /tmp/no-changes-reason.txt and stop.
+            - When you open the PR (see "Opening a PR" in your instructions), the title MUST start with the Jira ticket ID in brackets, e.g. `[${{ inputs.ticket_id }}] ...`.
+            ${{ needs.resolve-inputs.outputs.github_user != '' && format('- In /tmp/pr-body.txt, include a "DRI" section: **@{0}** is the responsible engineer for this PR.', needs.resolve-inputs.outputs.github_user) || '' }}
+            ${{ inputs.extra_prompt }}
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns ${{ needs.resolve-inputs.outputs.max_turns }}
+            --allowedTools "${{ inputs.allowed_tools }}"
+
+      # Keep the execution log so "no PR" outcomes are debuggable after teardown.
+      - name: Upload Claude execution output
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: claude-execution-output
+          # Action's output path, with a container-safe temp fallback.
+          path: |
+            ${{ steps.claude.outputs.execution_file }}
+            ${{ runner.temp }}/claude-execution-output.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Fresh app token for the PR: a token reused after the long agent run can
+      # 401, and an app token (unlike GITHUB_TOKEN) lets the new PR trigger CI.
+      - name: Generate token for PR creation
+        id: pr-token
+        if: steps.claude.outcome == 'success'
+        # actions/create-github-app-token@v2.2.1
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf
+        with:
+          app-id: ${{ secrets.CI_GITHUB_APP_ID }}
+          private-key: ${{ secrets.CI_GITHUB_APP_PRIVATE_KEY }}
+
+      # The agent pushes the branch and writes title/body to /tmp; we open the PR
+      # via github-script (not gh) so it works in containers without gh installed.
+      - name: Open PR
+        id: open-pr
+        if: steps.claude.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+          TICKET_ID: ${{ inputs.ticket_id }}
+        with:
+          # Fresh app token (see above); job token only if minting was skipped.
+          github-token: ${{ steps.pr-token.outputs.token || github.token }}
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('/tmp/pr-title.txt')) {
+              core.info('No /tmp/pr-title.txt: agent did not request a PR.');
+              return;
+            }
+            // The agent creates its own branch, so prefer the name it recorded
+            // in /tmp/pr-branch.txt, then branch_name, then the checked-out HEAD.
+            let branch = fs.existsSync('/tmp/pr-branch.txt')
+              ? fs.readFileSync('/tmp/pr-branch.txt', 'utf8').trim() : '';
+            if (!branch) {
+              branch = process.env.BRANCH_NAME;
+            }
+            if (!branch) {
+              const head = await exec.getExecOutput(
+                'git', ['rev-parse', '--abbrev-ref', 'HEAD'],
+                { silent: true, ignoreReturnCode: true });
+              branch = head.stdout.trim();
+            }
+            if (!branch || branch === 'HEAD') {
+              core.setFailed('Could not determine the PR branch: no /tmp/pr-branch.txt, no branch_name output, and git HEAD is detached.');
+              return;
+            }
+            // Prefix the ticket ID unless the title already leads with it
+            // (bracketed or not, case-insensitive), to avoid double-tagging.
+            const ticket = (process.env.TICKET_ID || '').trim();
+            let title = fs.readFileSync('/tmp/pr-title.txt', 'utf8').trim();
+            if (ticket) {
+              const t = title.toLowerCase();
+              const id = ticket.toLowerCase();
+              if (!t.startsWith(id) && !t.startsWith(`[${id}]`)) {
+                title = `[${ticket}] ${title}`;
+              }
+            }
+            const body = fs.existsSync('/tmp/pr-body.txt')
+              ? fs.readFileSync('/tmp/pr-body.txt', 'utf8') : '';
+            const { owner, repo } = context.repo;
+            const base = (await github.rest.repos.get({ owner, repo })).data.default_branch;
+            // Idempotent on re-runs: reuse an open PR for this exact branch.
+            const existing = await github.rest.pulls.list({
+              owner, repo, state: 'open', head: `${owner}:${branch}`,
+            });
+            const pr = existing.data[0]
+              || (await github.rest.pulls.create({ owner, repo, head: branch, base, title, body })).data;
+            core.setOutput('pr_url', pr.html_url);
+            core.setOutput('pr_number', String(pr.number));
+            core.info(`PR: ${pr.html_url}`);
+
+      # Classify outcome for the comment + flag steps; always() to cover failures.
+      - name: Classify outcome
+        id: classify
+        if: always()
+        env:
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          PR_URL: ${{ steps.open-pr.outputs.pr_url }}
+        run: |
+          if [ "$CLAUDE_OUTCOME" != "success" ]; then
+            STATUS="failed"
+          elif [ -n "$PR_URL" ]; then
+            STATUS="pr"
+          elif [ -f /tmp/no-changes-reason.txt ]; then
+            STATUS="no_changes"
+          else
+            # Succeeded but no PR and no stated reason: fell through the cracks.
+            STATUS="indeterminate"
+          fi
+          {
+            echo "status=$STATUS"
+            echo "pr_url=$PR_URL"
+          } >> "$GITHUB_OUTPUT"
+          echo "Outcome classified as: $STATUS (pr=${PR_URL:-none})"
+
+      - name: Assign responsible engineer to PR
+        if: needs.resolve-inputs.outputs.github_user != '' && steps.open-pr.outputs.pr_number != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          GITHUB_USER: ${{ needs.resolve-inputs.outputs.github_user }}
+          PR_NUMBER: ${{ steps.open-pr.outputs.pr_number }}
+        with:
+          script: |
+            await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              assignees: [process.env.GITHUB_USER],
+            });
+            core.info(`Assigned ${process.env.GITHUB_USER} to PR #${process.env.PR_NUMBER}`);
+
+      - name: Comment result on Jira ticket
+        if: always() && inputs.jira_base_url != '' && inputs.jira_user_email != ''
+        env:
+          JIRA_BASE_URL: ${{ inputs.jira_base_url }}
+          JIRA_USER_EMAIL: ${{ inputs.jira_user_email }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_ID: ${{ inputs.ticket_id }}
+          STATUS: ${{ steps.classify.outputs.status }}
+          PR_URL: ${{ steps.classify.outputs.pr_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$JIRA_API_TOKEN" ]; then
+            echo "JIRA_API_TOKEN not set, skipping Jira comment"
+            exit 0
+          fi
+
+          case "$STATUS" in
+            pr)
+              MSG="✅ Claude opened a PR for this ticket: $PR_URL"
+              ;;
+            no_changes)
+              REASON=$(cat /tmp/no-changes-reason.txt)
+              MSG="ℹ️ Claude determined no changes are needed for this SDK. Reason: $REASON. View logs: $RUN_URL"
+              ;;
+            indeterminate)
+              MSG="⚠️ Claude completed but opened no PR and gave no reason. This needs manual investigation. View logs: $RUN_URL"
+              ;;
+            *)
+              MSG="❌ Claude failed to implement this ticket. View logs: $RUN_URL"
+              ;;
+          esac
+
+          # Post comment to Jira using Atlassian Document Format
+          ESCAPED_MSG=$(echo "$MSG" | jq -Rs '.')
+          curl -sf -X POST \
+            "$JIRA_BASE_URL/rest/api/3/issue/$TICKET_ID/comment" \
+            -u "$JIRA_USER_EMAIL:$JIRA_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":${ESCAPED_MSG}}]}]}}"
+
+      # Fail the job on an indeterminate outcome so it shows red, not green.
+      - name: Flag indeterminate outcome
+        if: always() && steps.classify.outputs.status == 'indeterminate'
+        run: |
+          echo "::error::Claude finished with no PR and no /tmp/no-changes-reason.txt. Inspect the claude-execution-output artifact and run logs."
+          exit 1
+
+      - name: Notify Slack of failure
+        if: failure()
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+        with:
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "Claude Jira implementation failed for ${{ github.repository }} ${{ inputs.ticket_id }}: ${{ inputs.summary }}\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_AI_WORKFLOW_ALERT_WEBHOOK_URL }}

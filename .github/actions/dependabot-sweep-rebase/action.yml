@@ -1,0 +1,448 @@
+name: Dependabot Sweep Rebase
+description: >-
+  Rebase a single Dependabot sweep PR onto the default branch: reset the branch,
+  replay the original manifest patch and regenerate lockfiles, and fall back to
+  Claude only if the patch no longer applies. Then commit, force-push, comment,
+  or close the PR as a no-op.
+
+# Composite, not a reusable workflow: it must run as a step inside a normal matrix
+# job, because a `uses:` job's empty `needs`-derived matrix fails the whole run at
+# startup. Secrets are passed as inputs (composite actions can't read `secrets`).
+
+inputs:
+  # --- PR identification (required) ---
+  package:
+    description: Package name being rebased (e.g., golang.org/x/net)
+    required: true
+  severity:
+    description: Highest advisory severity for this package (critical|high|medium|low)
+    required: true
+  issue_number:
+    description: Linked tracking issue number
+    required: true
+  pr_number:
+    description: Pull request number being rebased
+    required: true
+  head_ref:
+    description: Branch name of the PR being rebased
+    required: true
+  head_sha:
+    description: Expected head SHA of the PR (used for --force-with-lease)
+    required: true
+  # --- Behavior (required) ---
+  allowed_tools:
+    description: Allowed tools string for claude-code-action (Claude fallback only)
+    required: true
+  # --- Behavior (optional) ---
+  install_command:
+    description: Command to install dependencies before the Claude fallback runs
+    required: false
+    default: ''
+  extra_prompt:
+    description: Extra instructions appended to the Claude fallback user prompt
+    required: false
+    default: ''
+  extra_system_prompt:
+    description: Extra instructions appended to the Claude fallback system prompt
+    required: false
+    default: ''
+  model:
+    description: Claude model to use for the fallback
+    required: false
+    default: claude-opus-4-6
+  max_turns:
+    description: Max conversation turns for the Claude fallback
+    required: false
+    default: '75'
+  show_full_output:
+    description: 'Show full JSON output from Claude Code. WARNING: may expose secrets in logs.'
+    required: false
+    default: 'false'
+  # --- Secrets (passed as inputs; composite actions cannot read `secrets`) ---
+  anthropic_api_key:
+    description: Anthropic API key for the Claude fallback
+    required: true
+  app_id:
+    description: GitHub App ID used to mint the workflow token
+    required: true
+  app_private_key:
+    description: GitHub App private key used to mint the workflow token
+    required: true
+  slack_webhook_url:
+    description: Slack incoming-webhook URL for failure alerts
+    required: false
+    default: ''
+  auth_test_credentials:
+    description: Auth test credentials exposed to the Claude fallback environment
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Generate GitHub App token
+      id: app-token
+      # actions/create-github-app-token@v2.2.1
+      uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf
+      with:
+        app-id: ${{ inputs.app_id }}
+        private-key: ${{ inputs.app_private_key }}
+
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        ref: ${{ inputs.head_ref }}
+        fetch-depth: 0
+        token: ${{ steps.app-token.outputs.token }}
+
+    - name: Attempt deterministic rebase (replay manifest patch onto default branch)
+      id: rebase-attempt
+      shell: bash
+      env:
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -e
+        ORIG_SHA=$(git rev-parse HEAD)
+        git fetch origin "$DEFAULT_BRANCH"
+        MERGE_BASE=$(git merge-base "origin/$DEFAULT_BRANCH" "$ORIG_SHA")
+        CHANGED_FILES=$(git diff --name-only "$MERGE_BASE..$ORIG_SHA" || true)
+
+        git reset --hard "origin/$DEFAULT_BRANCH"
+
+        # Lockfile basenames, excluded from the manifest patch. Each is either
+        # auto-regenerated below or falls back to Claude if no regen command.
+        LOCK_PATTERN='(^|/)(go\.sum|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|pubspec\.lock|Cargo\.lock|uv\.lock|poetry\.lock|Pipfile\.lock|Gemfile\.lock|composer\.lock|mix\.lock)$'
+        LOCK_FILES=$(echo "$CHANGED_FILES" | grep -E "$LOCK_PATTERN" || true)
+        MANIFEST_FILES=$(echo "$CHANGED_FILES" | grep -vE "$LOCK_PATTERN" || true)
+
+        # Build a per-dir regen plan in /tmp/rebase-plan.sh, one command per
+        # lockfile basename. Empty plan => no lockfiles changed.
+        : > /tmp/rebase-plan.sh
+        SEEN_KEYS=""
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          dir=$(dirname "$f")
+          base=$(basename "$f")
+          key="${dir}|${base}"
+          case "$SEEN_KEYS" in *"|${key}|"*) continue ;; esac
+          SEEN_KEYS="${SEEN_KEYS}|${key}|"
+
+          case "$base" in
+            go.sum)               cmd="go mod tidy" ;;
+            package-lock.json|npm-shrinkwrap.json) cmd="npm install --package-lock-only" ;;
+            pnpm-lock.yaml)       cmd="pnpm install --lockfile-only" ;;
+            pubspec.lock)         cmd="flutter pub get" ;;
+            Cargo.lock)           cmd="cargo generate-lockfile" ;;
+            uv.lock)              cmd="uv lock" ;;
+            poetry.lock)          cmd="poetry lock --no-update" ;;
+            *)                    cmd="" ;;
+          esac
+
+          if [ -z "$cmd" ]; then
+            echo "No regen command for ${f}; falling through to Claude."
+            echo "result=needs-claude" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '(cd %q && %s)\n' "$dir" "$cmd" >> /tmp/rebase-plan.sh
+        done <<< "$LOCK_FILES"
+
+        if [ -z "$MANIFEST_FILES" ]; then
+          echo "result=lockfile-only" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        mapfile -t FILE_ARRAY <<< "$MANIFEST_FILES"
+        git diff "$MERGE_BASE..$ORIG_SHA" -- "${FILE_ARRAY[@]}" > /tmp/manifest.patch
+
+        if [ ! -s /tmp/manifest.patch ]; then
+          echo "result=lockfile-only" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if git apply --check /tmp/manifest.patch 2>/tmp/apply-err.txt; then
+          git apply /tmp/manifest.patch
+          echo "result=clean" >> "$GITHUB_OUTPUT"
+        else
+          echo "Manifest patch did not apply cleanly:"
+          cat /tmp/apply-err.txt
+          echo "result=needs-claude" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Regenerate lockfiles (deterministic path)
+      if: steps.rebase-attempt.outputs.result != 'needs-claude'
+      shell: bash
+      run: |
+        if [ -s /tmp/rebase-plan.sh ]; then
+          cat /tmp/rebase-plan.sh
+          bash /tmp/rebase-plan.sh
+        else
+          echo "No lockfiles to regenerate."
+        fi
+
+    # ---- Claude fallback path (manifest conflict) ----
+
+    - name: Get issue body
+      if: steps.rebase-attempt.outputs.result == 'needs-claude'
+      id: issue
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const { data: issue } = await github.rest.issues.get({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: parseInt('${{ inputs.issue_number }}')
+          });
+          core.setOutput('body', issue.body || '');
+
+    - name: Install dependencies (Claude fallback)
+      if: steps.rebase-attempt.outputs.result == 'needs-claude' && inputs.install_command != ''
+      shell: bash
+      run: ${{ inputs.install_command }}
+
+    - name: Assemble system prompt (Claude fallback)
+      if: steps.rebase-attempt.outputs.result == 'needs-claude'
+      shell: bash
+      env:
+        EXTRA_SYSTEM_PROMPT: ${{ inputs.extra_system_prompt }}
+      run: |
+        {
+          echo "You are rebasing a Dependabot security fix against the latest default branch. Be precise and thorough."
+          echo ""
+          echo "## Critical: Action-First Approach"
+          echo "- ALWAYS try the update command first. Do NOT spend turns investigating compatibility before attempting the update."
+          echo "- If the update command fails, read the error message carefully — it will tell you what the conflict is."
+          echo "- If a tool call is denied, do NOT retry the same tool or variations of it. Move on to a different approach immediately."
+          echo "- You have a limited number of turns. Do not waste them on denied tool calls."
+          echo ""
+          echo "## Tool Usage"
+          echo "- Use Grep, Glob, and Read tools for file searching and reading — do not use Bash for these."
+          echo "- You MUST Read every file before you Edit it."
+          echo "- Do NOT use: curl, WebFetch, or WebSearch. These are not available."
+          echo ""
+          echo "## Dependency Sweep Rules"
+          echo "- Run the appropriate install/lock commands in each affected directory to regenerate lockfiles."
+          echo "- Do NOT add or update tests unless a code change is required to fix a breaking API change."
+          echo "- Implement the minimal change. No refactors or unnecessary additions."
+          echo "- Follow existing patterns. No new conventions or abstractions."
+          echo ""
+          echo "## Transitive Dependency Rules (CRITICAL)"
+          echo "- NEVER add a transitive dependency as a direct/explicit dependency in the manifest file (go.mod, package.json, etc.)."
+          echo "- If the vulnerable package is NOT already a direct dependency in the manifest, it is transitive — fix it by updating the PARENT dependency that pulls it in."
+          echo "- Use the advisory's patched_version to determine the MINIMUM parent version that pulls in the fix. Do NOT blindly update the parent to @latest — find the lowest version of the parent that depends on the patched transitive version."
+          echo "- To identify which direct dependency pulls in the vulnerable transitive package:"
+          echo "  - Go: run 'go mod graph | grep <vulnerable-package>'"
+          echo "  - npm: run 'npm ls <vulnerable-package>'"
+          echo "  - Python: run 'pip show <vulnerable-package>' or check pipdeptree"
+          echo "- For Go: update the parent with 'go get <parent-package>@<minimum-compatible-version>', then 'go mod tidy'."
+          echo "- For npm: update the parent version in package.json to the minimum version that pulls in the patched transitive, then 'npm install'."
+          echo "- For Python: update the parent package version constraint, then regenerate the lockfile."
+          echo "- After updating, verify the lockfile contains a version of the vulnerable package that meets or exceeds the patched_version from the advisory."
+          echo "- Only update lockfiles — the manifest file should only change if a DIRECT dependency version is being bumped."
+          echo "- If no version of the parent dependency pulls in the patched transitive version, as a LAST RESORT add the transitive dependency directly to the manifest with a comment explaining WHY."
+          echo ""
+          echo "## Workflow Boundary (REBASE MODE)"
+          echo "- The branch has already been reset to the default branch HEAD. The deterministic patch-replay failed (manifest conflict), so you are figuring out the fix from the advisory data."
+          echo "- You modify files ONLY. Do NOT run git, do NOT commit, do NOT push, do NOT open or close PRs."
+          echo "- The workflow detects whether files changed after you finish, then commits, force-pushes, and updates the PR."
+          if [ -n "$EXTRA_SYSTEM_PROMPT" ]; then
+            printf '\n%s\n' "$EXTRA_SYSTEM_PROMPT"
+          fi
+        } > /tmp/ci-system-prompt.md
+        {
+          echo "APPEND_SYSTEM_PROMPT<<__CI_PROMPT_EOF__"
+          cat /tmp/ci-system-prompt.md
+          echo "__CI_PROMPT_EOF__"
+        } >> "$GITHUB_ENV"
+
+    - name: Run Claude (manifest conflict fallback)
+      id: claude
+      if: steps.rebase-attempt.outputs.result == 'needs-claude'
+      uses: anthropics/claude-code-action@26ddc358fe3befff50c5ec2f80304c90c763f6f8 # v1.0.90
+      env:
+        AUTH_TEST_CREDENTIALS: ${{ inputs.auth_test_credentials }}
+      with:
+        anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        show_full_output: ${{ inputs.show_full_output }}
+        display_report: true
+        settings: .claude/settings.ci.json
+        prompt: |
+          You are rebasing the fix for `${{ inputs.package }}` against the latest default branch.
+          The deterministic manifest-patch replay failed (the manifest moved on the default branch), so you must re-derive the fix from the advisory data.
+          This rebases PR #${{ inputs.pr_number }} (linked issue #${{ inputs.issue_number }}).
+
+          ## Issue Details
+
+          ${{ steps.issue.outputs.body }}
+
+          ## Instructions
+
+          You modify files only. Do NOT run git, do NOT commit, do NOT push, do NOT open or close any PRs.
+
+          1. Read CLAUDE.md for repository conventions.
+
+          2. Look at the "Raw data" JSON in the issue above. It contains:
+             - `advisories`: each advisory with `patched_version` and `manifest_paths`
+             - `all_manifest_paths`: every lockfile/manifest affected by this package
+
+          3. For each affected manifest path:
+             a. Navigate to the directory containing the lockfile.
+             b. Check if `${{ inputs.package }}` is a DIRECT dependency or a TRANSITIVE dependency.
+             c. If DIRECT: bump it to the patched version.
+             d. If TRANSITIVE: identify the parent and update the parent to the minimum version that pulls in the patched transitive. Do NOT promote transitives to the manifest.
+             e. Regenerate the lockfile.
+             f. If conflicts arise, find the best resolution without promoting transitives.
+
+          4. Run any available build/lint/typecheck commands to verify nothing is broken.
+
+          5. Stop. The workflow handles commit / force-push / PR comment / close.
+
+          6. If `patched_version` is "no fix available", leave the working tree unchanged. The workflow will close the PR with a no-op comment.
+          ${{ inputs.extra_prompt }}
+        claude_args: |
+          --model ${{ inputs.model }}
+          --max-turns ${{ inputs.max_turns }}
+          --allowedTools "${{ inputs.allowed_tools }}"
+
+    # Keep the execution log (Claude fallback path only) for debugging; name is
+    # per-PR since matrix legs share one artifact namespace.
+    - name: Upload Claude execution output
+      if: always() && steps.claude.outcome != 'skipped'
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      with:
+        name: claude-execution-output-pr-${{ inputs.pr_number }}
+        # Action's output path, with a container-safe temp fallback.
+        path: |
+          ${{ steps.claude.outputs.execution_file }}
+          ${{ runner.temp }}/claude-execution-output.json
+        if-no-files-found: warn
+        retention-days: 7
+
+    # ---- Finalize: stage, commit, force-push (or close as no-op) ----
+
+    - name: Stage changes and detect diff
+      id: diff
+      shell: bash
+      run: |
+        git add -A
+        if [ -n "$(git diff --cached --name-only)" ]; then
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Commit and force-push rebased branch
+      if: steps.diff.outputs.changed == 'true'
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        SEVERITY: ${{ inputs.severity }}
+        HEAD_REF: ${{ inputs.head_ref }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git commit -m "fix(deps): update ${PACKAGE} (${SEVERITY}, rebased)"
+        git push --force-with-lease="${HEAD_REF}:${HEAD_SHA}" origin "HEAD:${HEAD_REF}"
+
+    - name: Comment on PR (rebased)
+      if: steps.diff.outputs.changed == 'true'
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const defaultBranch = context.payload.repository.default_branch;
+          const path = '${{ steps.rebase-attempt.outputs.result }}';
+          const note = path === 'needs-claude'
+            ? 'Rebased via Claude fallback (manifest conflict).'
+            : `Rebased deterministically (${path}).`;
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: parseInt('${{ inputs.pr_number }}'),
+            body: `${note} Onto current \`${defaultBranch}\`.`,
+          });
+
+    - name: Close PR (no-op rebase)
+      if: steps.diff.outputs.changed == 'false'
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const defaultBranch = context.payload.repository.default_branch;
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: parseInt('${{ inputs.pr_number }}'),
+            body: `The package is already at or above the patched version on \`${defaultBranch}\`. Closing this PR.`,
+          });
+          await github.rest.pulls.update({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: parseInt('${{ inputs.pr_number }}'),
+            state: 'closed',
+          });
+
+    - name: Build failure comment body
+      if: failure()
+      id: failure-comment
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        REBASE_RESULT: ${{ steps.rebase-attempt.outputs.result }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        EXEC_LOG="/home/runner/work/_temp/claude-execution-output.json"
+        DETAILS=""
+        if [ -f "$EXEC_LOG" ]; then
+          SUBTYPE=$(jq -r '.subtype // "unknown"' "$EXEC_LOG" 2>/dev/null || echo "unknown")
+          NUM_TURNS=$(jq -r '.num_turns // "?"' "$EXEC_LOG" 2>/dev/null || echo "?")
+          COST=$(jq -r '.total_cost_usd // "?"' "$EXEC_LOG" 2>/dev/null || echo "?")
+          DENIALS=$(jq -r '.permission_denials | length // 0' "$EXEC_LOG" 2>/dev/null || echo "0")
+          DETAILS=$(cat <<TABLE_EOF
+
+        | Detail | Value |
+        |--------|-------|
+        | Rebase path | \`${REBASE_RESULT:-unknown}\` |
+        | Failure reason | \`${SUBTYPE}\` |
+        | Turns used | ${NUM_TURNS} |
+        | Permission denials | ${DENIALS} |
+        | Cost | \$${COST} |
+        TABLE_EOF
+          )
+        fi
+
+        {
+          echo "body<<__FAILURE_COMMENT_EOF__"
+          echo "**Rebase failed for \`${PACKAGE}\`**"
+          echo ""
+          echo "The automated rebase did not complete successfully."
+          echo "${DETAILS}"
+          echo ""
+          echo "[View workflow run](${RUN_URL})"
+          echo "__FAILURE_COMMENT_EOF__"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Comment failure details on PR
+      if: failure() && steps.failure-comment.outputs.body != ''
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: parseInt('${{ inputs.pr_number }}'),
+            body: `${{ steps.failure-comment.outputs.body }}`
+          });
+
+    - name: Notify Slack of failure
+      if: failure() && inputs.slack_webhook_url != ''
+      uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+      with:
+        webhook-type: incoming-webhook
+        payload: |
+          {
+            "text": "Dependabot Sweep rebase failed for ${{ github.repository }} (package: ${{ inputs.package }}, PR #${{ inputs.pr_number }})\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.slack_webhook_url }}

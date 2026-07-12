@@ -1,0 +1,141 @@
+name: Check PR Approvals
+description: Fails if a PR lacks required approvals and posts a comment explaining the review process
+
+inputs:
+  pr_number:
+    description: 'Pull request number to check'
+    required: true
+  min_approvals:
+    description: 'Minimum number of approving reviews required'
+    required: false
+    default: '2'
+  github_token:
+    description: 'GitHub token with pull-requests read and issues write access'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # actions/github-script@v8.0.0
+    - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const { data: reviews } = await github.rest.pulls.listReviews({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: Number('${{ inputs.pr_number }}'),
+          });
+
+          // Keep only the latest review state per non-bot user
+          const latestByUser = {};
+          for (const review of reviews) {
+            if (review.user.type === 'Bot') continue;
+            latestByUser[review.user.login] = review.state;
+          }
+
+          const approvals = Object.values(latestByUser)
+            .filter(state => state === 'APPROVED').length;
+          const required = Number('${{ inputs.min_approvals }}');
+
+          core.info(`Approvals: ${approvals}/${required}`);
+
+          if (approvals >= required) {
+            // Approvals are now sufficient. When this run was triggered by a
+            // review, the pull_request-triggered run for this same commit may
+            // still be red: it executed at push time, before the approvals
+            // existed. Branch protection pins the required "check-approvals"
+            // status to that earlier run, so a passing review-triggered run
+            // does not turn the gate green on its own — a human has to re-run
+            // the failed pull_request run by hand. Do that automatically here.
+            if (context.eventName === 'pull_request_review') {
+              const headSha = context.payload.pull_request.head.sha;
+              try {
+                const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  event: 'pull_request',
+                  head_sha: headSha,
+                  per_page: 100,
+                });
+                const stale = runs.workflow_runs.filter(run =>
+                  run.name === context.workflow &&
+                  run.id !== context.runId &&
+                  run.status === 'completed' &&
+                  run.conclusion !== 'success'
+                );
+                if (stale.length === 0) {
+                  core.info('No stale pull_request run to refresh for this commit');
+                }
+                for (const run of stale) {
+                  core.info(`Re-running stale run ${run.id} to refresh the required status`);
+                  await github.rest.actions.reRunWorkflowFailedJobs({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: run.id,
+                  });
+                }
+              } catch (err) {
+                // Re-running a workflow needs `actions: write`. If the caller
+                // didn't grant it, don't fail the check — fall back to the
+                // prior behavior where the failed run is re-run manually.
+                core.warning(
+                  `Could not refresh the stale pull_request run: ${err.message}. ` +
+                  'Grant the caller workflow `actions: write` to enable automatic refresh.'
+                );
+              }
+            }
+          } else {
+            // Fetch the PR to get the assignee
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number('${{ inputs.pr_number }}'),
+            });
+            const assignee = pr.assignee ? `@${pr.assignee.login}` : 'the assignee';
+
+            // Post an informational comment explaining the review requirements
+            const marker = '<!-- check-approvals-notice -->';
+            const body = [
+              marker,
+              '## Review Required',
+              '',
+              `This PR was opened by Claude and requires a minimum of **${required} approving reviews** before it can be merged.`,
+              '',
+              '**Review process:**',
+              `1. ${assignee} — as the person who triggered this Claude workflow, you should review the code thoroughly and submit your approval.`,
+              '2. Request additional reviewers for the remaining required approvals.',
+              '',
+              `Current status: **${approvals}/${required}** approvals.`,
+            ].join('\n');
+
+            // Check if we already posted this comment to avoid duplicates
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number('${{ inputs.pr_number }}'),
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info('Updated existing approvals notice comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number('${{ inputs.pr_number }}'),
+                body,
+              });
+              core.info('Posted approvals notice comment');
+            }
+
+            core.setFailed(
+              `Requires ${required} approving reviews (currently ${approvals})`
+            );
+          }
